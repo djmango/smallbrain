@@ -17,3 +17,7 @@ Cargo.lock
 # Added by cargo
 
 /target
+
+# https://content.neuralink.com/compression-challenge/data.zip
+data/
+*.DS_Store
