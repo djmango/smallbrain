@@ -1,16 +1,12 @@
-extern crate hound;
-extern crate rayon;
-
+use flate2::{read::ZlibDecoder, write::ZlibEncoder, Compression};
 use hound::{WavReader, WavSpec, WavWriter};
 use rayon::prelude::*;
 use std::env;
 use std::error::Error;
 use std::fs::{self, File};
-use std::io::{BufRead, BufReader, BufWriter, Cursor, Read, Write};
+use std::io::{BufReader, BufWriter, Cursor, Read, Write};
 use std::path::Path;
 use std::process::Command;
-
-mod riff;
 
 fn read_wav_file(file_path: &str) -> Result<(Vec<i16>, WavSpec), Box<dyn Error + Send + Sync>> {
     println!("Reading WAV file from {}", file_path);
@@ -40,39 +36,45 @@ fn compress(samples: &[i16], spec: &WavSpec) -> Result<Vec<u8>, Box<dyn Error + 
     println!("Compressing data into memory...");
     let mut buffer = Vec::new();
 
-    // Create a block to limit the scope of `writer` and ensure it's dropped
-    {
-        let mut writer = BufWriter::new(&mut buffer);
+    let mut encoder = ZlibEncoder::new(&mut buffer, Compression::default());
 
-        // Write the metadata
-        writeln!(writer, "{}", samples.len())?;
-        writeln!(writer, "{}", spec.sample_rate)?;
-        writeln!(writer, "{}", spec.bits_per_sample)?;
-        writeln!(writer, "{}", spec.channels)?;
+    // Write the metadata
+    encoder.write_all(&(samples.len() as u32).to_le_bytes())?;
+    encoder.write_all(&spec.sample_rate.to_le_bytes())?;
+    encoder.write_all(&spec.bits_per_sample.to_le_bytes())?;
+    encoder.write_all(&spec.channels.to_le_bytes())?;
 
-        // Write the samples
-        for &sample in samples {
-            writeln!(writer, "{}", sample)?;
-        }
+    // Write the samples
+    for &sample in samples {
+        encoder.write_all(&sample.to_le_bytes())?;
+    }
 
-        writer.flush()?; // Flush to ensure all writing is done
-    } // Here `writer` goes out of scope and is dropped
-
+    encoder.finish()?;
     println!("Finished compressing data into memory");
     Ok(buffer)
 }
 
 fn decompress(buffer: &[u8]) -> Result<(Vec<i16>, WavSpec), Box<dyn Error + Send + Sync>> {
     println!("Decompressing data from memory...");
-    let cursor = Cursor::new(buffer);
-    let file = BufReader::new(cursor);
-    let mut lines = file.lines();
+    let mut cursor = Cursor::new(buffer);
+    let mut decoder = ZlibDecoder::new(&mut cursor);
 
     // Read the metadata
-    let total_samples: usize = lines.next().unwrap()?.trim().parse()?;
-    let sample_rate: u32 = lines.next().unwrap()?.trim().parse()?;
-    let bits_per_sample: u16 = lines.next().unwrap()?.trim().parse()?;
-    let channels: u16 = lines.next().unwrap()?.trim().parse()?;
+    let mut len_bytes = [0u8; 4];
+    decoder.read_exact(&mut len_bytes)?;
+    let total_samples = u32::from_le_bytes(len_bytes) as usize;
+
+    let mut sample_rate_bytes = [0u8; 4];
+    decoder.read_exact(&mut sample_rate_bytes)?;
+    let sample_rate = u32::from_le_bytes(sample_rate_bytes);
+
+    let mut bits_per_sample_bytes = [0u8; 2];
+    decoder.read_exact(&mut bits_per_sample_bytes)?;
+    let bits_per_sample = u16::from_le_bytes(bits_per_sample_bytes);
+
+    let mut channels_bytes = [0u8; 2];
+    decoder.read_exact(&mut channels_bytes)?;
+    let channels = u16::from_le_bytes(channels_bytes);
 
     println!(
         "Decompressing {} samples with spec: sample_rate = {}, bits_per_sample = {}, channels = {}",
@@ -80,10 +82,12 @@ fn decompress(buffer: &[u8]) -> Result<(Vec<i16>, WavSpec), Box<dyn Error + Send
     );
 
     // Read the samples
-    let samples: Vec<i16> = lines
-        .take(total_samples)
-        .map(|line| line.unwrap().trim().parse().unwrap())
-        .collect();
+    let mut samples = Vec::with_capacity(total_samples);
+    for _ in 0..total_samples {
+        let mut sample_bytes = [0u8; 2];
+        decoder.read_exact(&mut sample_bytes)?;
+        samples.push(i16::from_le_bytes(sample_bytes));
+    }
 
     let spec = WavSpec {
         channels,
