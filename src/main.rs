@@ -1,5 +1,6 @@
+use brotli::CompressorWriter;
+use brotli::Decompressor;
 use ffmpeg_next as ffmpeg;
-use flate2::{read::ZlibDecoder, write::ZlibEncoder, Compression};
 use hound::{WavReader, WavSpec, WavWriter};
 use indicatif::{ProgressBar, ProgressStyle};
 use rayon::prelude::*;
@@ -156,12 +157,101 @@ fn decompress_flac(buffer: &[u8]) -> Result<(Vec<i16>, WavSpec), Box<dyn Error +
     Ok((samples, spec))
 }
 
+fn compress_zlib(samples: &[i16], spec: &WavSpec) -> Result<Vec<u8>, Box<dyn Error + Send + Sync>> {
+    info!("Compressing data into zlib format...");
+
+    // Prepare WAV data in memory using Cursor
+    let mut wav_data = Cursor::new(Vec::new());
+    {
+        let mut writer = WavWriter::new(&mut wav_data, *spec)?;
+        for &sample in samples {
+            writer.write_sample(sample)?;
+        }
+        writer.finalize()?;
+    }
+
+    // Compress WAV data using zlib
+    let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
+    encoder.write_all(&wav_data.get_ref())?;
+    let compressed_data = encoder.finish()?;
+
+    info!("Finished compressing data into zlib format");
+    Ok(compressed_data)
+}
+
+fn decompress_zlib(buffer: &[u8]) -> Result<(Vec<i16>, WavSpec), Box<dyn Error + Send + Sync>> {
+    info!("Decompressing data from zlib format...");
+
+    // Decompress zlib data to WAV in memory
+    let mut decompressed_data = Vec::new();
+    {
+        let mut decoder = ZlibDecoder::new(buffer);
+        decoder.read_to_end(&mut decompressed_data)?;
+    }
+
+    // Parse WAV data
+    let mut cursor = Cursor::new(&decompressed_data);
+    let mut reader = WavReader::new(&mut cursor)?;
+    let spec = reader.spec();
+    let samples: Vec<i16> = reader.samples().map(|s| s.unwrap()).collect();
+
+    info!("Finished decompressing data from zlib format");
+    Ok((samples, spec))
+}
+
+fn compress_brotli(
+    samples: &[i16],
+    spec: &WavSpec,
+) -> Result<Vec<u8>, Box<dyn Error + Send + Sync>> {
+    info!("Compressing data into Brotli format...");
+
+    // Prepare WAV data in memory using Cursor
+    let mut wav_data = Cursor::new(Vec::new());
+    {
+        let mut writer = WavWriter::new(&mut wav_data, *spec)?;
+        for &sample in samples {
+            writer.write_sample(sample)?;
+        }
+        writer.finalize()?;
+    }
+
+    // Compress WAV data using Brotli
+    let mut compressed_data = Vec::new();
+    {
+        let mut compressor = CompressorWriter::new(&mut compressed_data, 4096, 11, 22);
+        compressor.write_all(&wav_data.get_ref())?;
+    }
+
+    info!("Finished compressing data into Brotli format");
+    Ok(compressed_data)
+}
+
+fn decompress_brotli(buffer: &[u8]) -> Result<(Vec<i16>, WavSpec), Box<dyn Error + Send + Sync>> {
+    info!("Decompressing data from Brotli format...");
+
+    // Decompress Brotli data to WAV in memory
+    let mut decompressed_data = Vec::new();
+    {
+        let mut decompressor = Decompressor::new(buffer, 4096);
+        decompressor.read_to_end(&mut decompressed_data)?;
+    }
+
+    // Parse WAV data
+    let mut cursor = Cursor::new(&decompressed_data);
+    let mut reader = WavReader::new(&mut cursor)?;
+    let spec = reader.spec();
+    let samples: Vec<i16> = reader.samples().map(|s| s.unwrap()).collect();
+
+    info!("Finished decompressing data from Brotli format");
+    Ok((samples, spec))
+}
+
 fn compress(samples: &[i16], spec: &WavSpec) -> Result<Vec<u8>, Box<dyn Error + Send + Sync>> {
-    compress_flac(samples, spec)
+    compress_brotli(samples, spec)
 }
 
 fn decompress(buffer: &[u8]) -> Result<(Vec<i16>, WavSpec), Box<dyn Error + Send + Sync>> {
-    decompress_flac(buffer)
+    decompress_brotli(buffer)
 }
 
 fn process_batch(input_dir: &str) -> Result<(), Box<dyn Error + Send + Sync>> {

@@ -1,1 +1,1 @@
-cargo run --release process_batch ./data
+cargo run --release process_batch ./data --enable-logs
