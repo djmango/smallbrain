@@ -21,6 +21,6 @@ Cargo.lock
 # https://content.neuralink.com/compression-challenge/data.zip
 data/
 *.DS_Store
-viz/
+# viz/
 encode
 decode
