@@ -1,19 +1,39 @@
+use ffmpeg_next as ffmpeg;
 use flate2::{read::ZlibDecoder, write::ZlibEncoder, Compression};
 use hound::{WavReader, WavSpec, WavWriter};
+use indicatif::{ProgressBar, ProgressStyle};
 use rayon::prelude::*;
 use std::env;
 use std::error::Error;
-use std::fs::{self, File};
+use std::fs;
+use std::fs::File;
 use std::io::{BufReader, BufWriter, Cursor, Read, Write};
 use std::path::Path;
-use std::process::Command;
+use std::process::{Command, Stdio};
+use std::sync::{Arc, Mutex};
+use tracing::{info, Level};
+use tracing_subscriber::FmtSubscriber;
+
+fn initialize_tracing(enable_logs: bool) {
+    let subscriber = FmtSubscriber::builder()
+        .with_max_level(if enable_logs {
+            Level::INFO
+        } else {
+            Level::ERROR
+        })
+        .without_time()
+        .finish();
+
+    tracing::subscriber::set_global_default(subscriber).expect("setting default subscriber failed");
+}
 
 fn read_wav_file(file_path: &str) -> Result<(Vec<i16>, WavSpec), Box<dyn Error + Send + Sync>> {
-    println!("Reading WAV file from {}", file_path);
+    info!("Reading WAV file from {}", file_path);
     let mut reader = WavReader::open(file_path)?;
     let samples: Vec<i16> = reader.samples().map(|s| s.unwrap()).collect();
     let spec = reader.spec();
-    println!("Read {} samples", samples.len());
+
+    info!("Read {} samples", samples.len());
     Ok((samples, spec))
 }
 
@@ -22,90 +42,134 @@ fn write_wav_file(
     samples: &[i16],
     spec: WavSpec,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
-    println!("Writing WAV file to {}", output_path);
+    info!("Writing WAV file to {}", output_path);
     let mut writer = WavWriter::create(output_path, spec)?;
     for &sample in samples {
         writer.write_sample(sample)?;
     }
     writer.finalize()?;
-    println!("Finished writing WAV file to {}", output_path);
+    info!("Finished writing WAV file to {}", output_path);
     Ok(())
 }
 
-fn compress(samples: &[i16], spec: &WavSpec) -> Result<Vec<u8>, Box<dyn Error + Send + Sync>> {
-    println!("Compressing data into memory...");
-    let mut buffer = Vec::new();
+fn compress_flac(samples: &[i16], spec: &WavSpec) -> Result<Vec<u8>, Box<dyn Error + Send + Sync>> {
+    info!("Compressing data into FLAC format...");
 
-    let mut encoder = ZlibEncoder::new(&mut buffer, Compression::default());
+    // Initialize the FFmpeg library
+    ffmpeg::init().expect("Could not initialize ffmpeg");
 
-    // Write the metadata
-    encoder.write_all(&(samples.len() as u32).to_le_bytes())?;
-    encoder.write_all(&spec.sample_rate.to_le_bytes())?;
-    encoder.write_all(&spec.bits_per_sample.to_le_bytes())?;
-    encoder.write_all(&spec.channels.to_le_bytes())?;
-
-    // Write the samples
-    for &sample in samples {
-        encoder.write_all(&sample.to_le_bytes())?;
+    // Prepare WAV data in memory using Cursor
+    let mut wav_data = Cursor::new(Vec::new());
+    {
+        let mut writer = WavWriter::new(&mut wav_data, *spec)?;
+        for &sample in samples {
+            writer.write_sample(sample)?;
+        }
+        writer.finalize()?;
     }
 
-    encoder.finish()?;
-    println!("Finished compressing data into memory");
-    Ok(buffer)
+    // Use ffmpeg to convert WAV to FLAC in memory
+    let mut child = Command::new("ffmpeg")
+        .args(&["-f", "wav", "-i", "pipe:0", "-f", "flac", "pipe:1"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+
+    {
+        // Write WAV data to ffmpeg's stdin
+        let stdin = child.stdin.as_mut().ok_or("Failed to open stdin")?;
+        stdin.write_all(&wav_data.get_ref())?;
+    }
+    // Important: Close the child's stdin to signal that we are done writing
+    drop(child.stdin.take());
+
+    // Read FLAC data from ffmpeg's stdout
+    let mut flac_data = Vec::new();
+    {
+        let stdout = child.stdout.as_mut().ok_or("Failed to open stdout")?;
+        stdout.read_to_end(&mut flac_data)?;
+    }
+
+    // Capture stderr
+    let mut stderr = String::new();
+    if let Some(ref mut err) = child.stderr {
+        err.read_to_string(&mut stderr).ok();
+    }
+
+    let status = child.wait()?;
+    if !status.success() {
+        return Err(format!("ffmpeg failed to convert WAV to FLAC. Error: {}", stderr).into());
+    }
+
+    info!("Finished compressing data into FLAC format");
+    Ok(flac_data)
+}
+
+fn decompress_flac(buffer: &[u8]) -> Result<(Vec<i16>, WavSpec), Box<dyn Error + Send + Sync>> {
+    info!("Decompressing data from FLAC format...");
+
+    // Initialize the FFmpeg library
+    ffmpeg::init().expect("Could not initialize ffmpeg");
+
+    // Use ffmpeg to convert FLAC to WAV in memory
+    let mut child = Command::new("ffmpeg")
+        .args(&["-f", "flac", "-i", "pipe:0", "-f", "wav", "pipe:1"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+
+    {
+        // Write FLAC data to ffmpeg's stdin
+        let stdin = child.stdin.as_mut().ok_or("Failed to open stdin")?;
+        stdin.write_all(buffer)?;
+    }
+    // Important: Close the child's stdin to signal that we are done writing
+    drop(child.stdin.take());
+
+    // Read WAV data from ffmpeg's stdout
+    let mut wav_data = Vec::new();
+    {
+        let stdout = child.stdout.as_mut().ok_or("Failed to open stdout")?;
+        stdout.read_to_end(&mut wav_data)?;
+    }
+
+    // Capture stderr
+    let mut stderr = String::new();
+    if let Some(ref mut err) = child.stderr {
+        err.read_to_string(&mut stderr).ok();
+    }
+
+    let status = child.wait()?;
+    if !status.success() {
+        return Err(format!("ffmpeg failed to convert FLAC to WAV. Error: {}", stderr).into());
+    }
+
+    // Parse WAV data
+    let mut cursor = Cursor::new(&wav_data);
+    let mut reader = WavReader::new(&mut cursor)?;
+    let spec = reader.spec();
+    let samples: Vec<i16> = reader.samples().map(|s| s.unwrap()).collect();
+
+    info!("Finished decompressing data from FLAC format");
+    Ok((samples, spec))
+}
+
+fn compress(samples: &[i16], spec: &WavSpec) -> Result<Vec<u8>, Box<dyn Error + Send + Sync>> {
+    compress_flac(samples, spec)
 }
 
 fn decompress(buffer: &[u8]) -> Result<(Vec<i16>, WavSpec), Box<dyn Error + Send + Sync>> {
-    println!("Decompressing data from memory...");
-    let mut cursor = Cursor::new(buffer);
-    let mut decoder = ZlibDecoder::new(&mut cursor);
-
-    // Read the metadata
-    let mut len_bytes = [0u8; 4];
-    decoder.read_exact(&mut len_bytes)?;
-    let total_samples = u32::from_le_bytes(len_bytes) as usize;
-
-    let mut sample_rate_bytes = [0u8; 4];
-    decoder.read_exact(&mut sample_rate_bytes)?;
-    let sample_rate = u32::from_le_bytes(sample_rate_bytes);
-
-    let mut bits_per_sample_bytes = [0u8; 2];
-    decoder.read_exact(&mut bits_per_sample_bytes)?;
-    let bits_per_sample = u16::from_le_bytes(bits_per_sample_bytes);
-
-    let mut channels_bytes = [0u8; 2];
-    decoder.read_exact(&mut channels_bytes)?;
-    let channels = u16::from_le_bytes(channels_bytes);
-
-    println!(
-        "Decompressing {} samples with spec: sample_rate = {}, bits_per_sample = {}, channels = {}",
-        total_samples, sample_rate, bits_per_sample, channels
-    );
-
-    // Read the samples
-    let mut samples = Vec::with_capacity(total_samples);
-    for _ in 0..total_samples {
-        let mut sample_bytes = [0u8; 2];
-        decoder.read_exact(&mut sample_bytes)?;
-        samples.push(i16::from_le_bytes(sample_bytes));
-    }
-
-    let spec = WavSpec {
-        channels,
-        sample_rate,
-        bits_per_sample,
-        sample_format: hound::SampleFormat::Int,
-    };
-
-    println!("Finished decompressing data from memory");
-    Ok((samples, spec))
+    decompress_flac(buffer)
 }
 
 fn process_batch(input_dir: &str) -> Result<(), Box<dyn Error + Send + Sync>> {
     let start = std::time::Instant::now();
-    println!("Removing existing data directory...");
+    info!("Removing existing data directory...");
     fs::remove_dir_all(input_dir).ok(); // This will ignore the error if the directory does not exist
 
-    println!("Unzipping data.zip...");
+    info!("Unzipping data.zip...");
     Command::new("unzip").arg("data.zip").output()?;
 
     let data_dir = Path::new(input_dir);
@@ -115,45 +179,65 @@ fn process_batch(input_dir: &str) -> Result<(), Box<dyn Error + Send + Sync>> {
         .filter(|entry| entry.path().extension().and_then(|s| s.to_str()) == Some("wav"))
         .collect();
 
+    let bar = ProgressBar::new(entries.len() as u64);
+    bar.set_style(
+        ProgressStyle::default_bar().template("{pos}/{len} [{elapsed}] - {wide_bar} {msg}")?,
+    );
+
+    let failed_files = Arc::new(Mutex::new(vec![]));
+
     // Process each entry in parallel
     let results: Vec<Result<(u64, u64), Box<dyn Error + Send + Sync>>> = entries
         .par_iter()
         .map(|entry| {
             let path = entry.path();
             let file_path = path.to_str().unwrap();
-            println!("Processing {}", file_path);
             let decompressed_file_path = format!("{}.copy", file_path);
+            let failed_files = Arc::clone(&failed_files);
 
-            let (samples, spec) = read_wav_file(file_path)?;
-            let compressed_data = compress(&samples, &spec)?;
-            let (decompressed_samples, decompressed_spec) = decompress(&compressed_data)?;
+            let result = (|| {
+                info!("Processing {}", file_path);
 
-            write_wav_file(
-                &decompressed_file_path,
-                &decompressed_samples,
-                decompressed_spec,
-            )?;
+                let (samples, spec) = read_wav_file(file_path)?;
+                let compressed_data = compress(&samples, &spec)?;
+                let (decompressed_samples, decompressed_spec) = decompress(&compressed_data)?;
 
-            let file_size = fs::metadata(file_path)?.len();
-            let compressed_size = compressed_data.len() as u64;
+                write_wav_file(
+                    &decompressed_file_path,
+                    &decompressed_samples,
+                    decompressed_spec,
+                )?;
 
-            if fs::read(file_path)? == fs::read(&decompressed_file_path)? {
-                println!(
-                    "{} losslessly compressed from {} bytes to {} bytes",
-                    file_path, file_size, compressed_size
-                );
-                Ok((file_size, compressed_size))
-            } else {
-                eprintln!(
-                    "ERROR: {} and {} are different.",
-                    file_path, decompressed_file_path
-                );
-                Err(Box::from(
-                    "Decompressed file is different from the original.",
-                ))
+                let file_size = fs::metadata(file_path)?.len();
+                let compressed_size = compressed_data.len() as u64;
+
+                let is_equal = fs::read(file_path)? == fs::read(&decompressed_file_path)?;
+                if is_equal {
+                    info!(
+                        "{} losslessly compressed from {} bytes to {} bytes",
+                        file_path, file_size, compressed_size
+                    );
+                    Ok((file_size, compressed_size))
+                } else {
+                    Err(Box::from(format!(
+                        "ERROR: {} and {} are different.",
+                        file_path, decompressed_file_path
+                    )))
+                }
+            })();
+
+            bar.inc(1);
+
+            if let Err(ref e) = result {
+                bar.println(format!("Error processing {}: {}", file_path, e));
+                failed_files.lock().unwrap().push(file_path.to_string());
             }
+
+            result
         })
         .collect();
+
+    bar.finish_and_clear();
 
     // Aggregate results
     let (total_size_raw, total_size_compressed) = results
@@ -162,16 +246,28 @@ fn process_batch(input_dir: &str) -> Result<(), Box<dyn Error + Send + Sync>> {
         .fold((0u64, 0u64), |acc, &(fs, cs)| (acc.0 + fs, acc.1 + cs));
 
     if results.iter().any(Result::is_err) {
+        for err in results.iter().filter_map(|res| res.as_ref().err()) {
+            eprintln!("{}", err);
+        }
+
+        let failed_files = failed_files.lock().unwrap();
+        if !failed_files.is_empty() {
+            eprintln!("The following files failed to process:");
+            for file in failed_files.iter() {
+                eprintln!("{}", file);
+            }
+        }
+
         return Err(Box::from("Some files failed to be processed."));
     }
 
     let compression_ratio = total_size_raw as f64 / total_size_compressed as f64;
 
-    println!("All recordings successfully compressed.");
-    println!("Original size (bytes): {}", total_size_raw);
-    println!("Compressed size (bytes): {}", total_size_compressed);
-    println!("Compression ratio: {:.2}", compression_ratio);
-    println!("Time taken: {:.2?}", start.elapsed());
+    info!("All recordings successfully compressed.");
+    info!("Original size (bytes): {}", total_size_raw);
+    info!("Compressed size (bytes): {}", total_size_compressed);
+    info!("Compression ratio: {:.2}", compression_ratio);
+    info!("Time taken: {:.2?}", start.elapsed());
 
     Ok(())
 }
@@ -181,11 +277,15 @@ fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
 
     if args.len() < 2 {
         eprintln!(
-            "Usage:\n  To compress:   {} compress <input_wav> <output_file>\n  To decompress: {} decompress <input_file> <output_wav>\n  To process batch: {} process_batch <input_dir>",
+            "Usage:\n  To compress:   {} compress <input_wav> <output_file>\n  To decompress: {} decompress <input_file> <output_wav>\n  To process batch: {} process_batch <input_dir> [--enable-logs]",
             args[0], args[0], args[0]
         );
         std::process::exit(1);
     }
+
+    // Add a flag to enable logs
+    let enable_logs = args.contains(&"--enable-logs".to_string());
+    initialize_tracing(enable_logs);
 
     let command = &args[1];
 
@@ -217,7 +317,10 @@ fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         }
         "process_batch" => {
             if args.len() < 3 {
-                eprintln!("Usage: {} process_batch <input_dir>", args[0]);
+                eprintln!(
+                    "Usage: {} process_batch <input_dir> [--enable-logs]",
+                    args[0]
+                );
                 std::process::exit(1);
             }
             let input_dir = &args[2];

@@ -4,7 +4,11 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+ffmpeg-next = "7.0.1"
 flate2 = "1.0.30"
 hound = "3.5.1"
+indicatif = { version = "0.17.8", features = ["rayon"] }
 plotters = "0.3.6"
 rayon = "1.10.0"
+tracing = "0.1.40"
+tracing-subscriber = "0.3.18"
