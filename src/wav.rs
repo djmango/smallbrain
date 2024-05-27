@@ -1,6 +1,6 @@
 use hound::{WavReader, WavSpec, WavWriter};
 use std::error::Error;
-use tracing::{debug, info};
+use tracing::debug;
 
 pub fn read_wav_file(file_path: &str) -> Result<(Vec<i16>, WavSpec), Box<dyn Error + Send + Sync>> {
     debug!("Reading WAV file from {}", file_path);

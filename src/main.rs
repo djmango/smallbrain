@@ -5,6 +5,7 @@ use indicatif::{ProgressBar, ProgressStyle};
 use rayon::prelude::*;
 use std::env;
 use std::error::Error;
+use std::fmt::Write as FmtWrite;
 use std::fs;
 use std::fs::File;
 use std::io::{BufReader, BufWriter, Read, Write};
@@ -16,6 +17,7 @@ use tracing_subscriber::FmtSubscriber;
 
 mod brotli_sb;
 mod flac;
+mod tenbit;
 mod wav;
 mod zlib;
 
@@ -38,6 +40,50 @@ fn compress(samples: &[i16], spec: &WavSpec) -> Result<Vec<u8>, Box<dyn Error + 
 
 fn decompress(buffer: &[u8]) -> Result<(Vec<i16>, WavSpec), Box<dyn Error + Send + Sync>> {
     decompress_brotli(buffer)
+}
+
+fn print_diff(original: &[u8], decompressed: &[u8]) {
+    let min_len = std::cmp::min(original.len(), decompressed.len());
+    let mut diff_count = 0;
+    let mut diff_output = String::new();
+
+    for i in 0..min_len {
+        if original[i] != decompressed[i] {
+            writeln!(
+                &mut diff_output,
+                "Byte {}: original = {:02X}, decompressed = {:02X}",
+                i, original[i], decompressed[i]
+            )
+            .unwrap();
+            diff_count += 1;
+            if diff_count > 20 {
+                writeln!(
+                    &mut diff_output,
+                    "-- More differences follow, limit of 20 differences shown --"
+                )
+                .unwrap();
+                break;
+            }
+        }
+    }
+
+    if original.len() > min_len {
+        writeln!(
+            &mut diff_output,
+            "Original file has extra bytes starting from byte {}",
+            min_len
+        )
+        .unwrap();
+    } else if decompressed.len() > min_len {
+        writeln!(
+            &mut diff_output,
+            "Decompressed file has extra bytes starting from byte {}",
+            min_len
+        )
+        .unwrap();
+    }
+
+    println!("{}", diff_output);
 }
 
 fn process_batch(input_dir: &str) -> Result<(), Box<dyn Error + Send + Sync>> {
@@ -84,22 +130,40 @@ fn process_batch(input_dir: &str) -> Result<(), Box<dyn Error + Send + Sync>> {
                     decompressed_spec,
                 )?;
 
+                let original_contents = fs::read(file_path)?;
+                let decompressed_contents = fs::read(&decompressed_file_path)?;
+
                 let file_size = fs::metadata(file_path)?.len();
                 let compressed_size = compressed_data.len() as u64;
 
-                let is_equal = fs::read(file_path)? == fs::read(&decompressed_file_path)?;
-                if is_equal {
+                if original_contents == decompressed_contents {
                     debug!(
                         "{} losslessly compressed from {} bytes to {} bytes",
                         file_path, file_size, compressed_size
                     );
                     Ok((file_size, compressed_size))
                 } else {
+                    print_diff(&original_contents, &decompressed_contents);
                     Err(Box::from(format!(
                         "ERROR: {} and {} are different.",
                         file_path, decompressed_file_path
                     )))
                 }
+
+                // let is_equal = fs::read(file_path)? == fs::read(&decompressed_file_path)?;
+                // if is_equal {
+                //     debug!(
+                //         "{} losslessly compressed from {} bytes to {} bytes",
+                //         file_path, file_size, compressed_size
+                //     );
+                //     Ok((file_size, compressed_size))
+                // } else {
+                //     print_diff(&original_contents, &decompressed_contents);
+                //     Err(Box::from(format!(
+                //         "ERROR: {} and {} are different.",
+                //         file_path, decompressed_file_path
+                //     )))
+                // }
             })();
 
             bar.inc(1);

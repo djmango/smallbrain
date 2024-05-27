@@ -3,7 +3,7 @@ use flate2::write::ZlibEncoder;
 use flate2::Compression;
 use hound::{WavReader, WavSpec, WavWriter};
 use std::error::Error;
-use std::io::{BufReader, BufWriter, Cursor, Read, Write};
+use std::io::{Cursor, Read, Write};
 use tracing::debug;
 
 pub fn compress_zlib(

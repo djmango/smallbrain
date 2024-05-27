@@ -5,6 +5,7 @@ edition = "2021"
 
 [dependencies]
 brotli = "6.0.0"
+bytemuck = "1.16.0"
 ffmpeg-next = "7.0.1"
 flate2 = "1.0.30"
 hound = "3.5.1"
