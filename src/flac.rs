@@ -1,113 +1,60 @@
-use ffmpeg_next as ffmpeg;
+use claxon::FlacReader;
+use flacenc::component::BitRepr;
+use flacenc::error::Verify;
 use hound::{WavReader, WavSpec, WavWriter};
 use std::error::Error;
-use std::io::{Cursor, Read, Write};
-use std::process::{Command, Stdio};
-use tracing::info;
+use std::fs;
+use std::path::Path;
+use tracing::{debug, error};
 
+// Compress WAV data to FLAC format using flacenc crate
 pub fn compress_flac(
     samples: &[i16],
     spec: &WavSpec,
 ) -> Result<Vec<u8>, Box<dyn Error + Send + Sync>> {
-    info!("Compressing data into FLAC format...");
+    debug!("Compressing data into FLAC format...");
 
-    // Initialize the FFmpeg library
-    ffmpeg::init().expect("Could not initialize ffmpeg");
+    let samples_as_i32: Vec<i32> = samples.iter().map(|&s| s as i32).collect();
+    let (channels, bits_per_sample, sample_rate) =
+        (spec.channels as u8, spec.bits_per_sample, spec.sample_rate);
 
-    // Prepare WAV data in memory using Cursor
-    let mut wav_data = Cursor::new(Vec::new());
-    {
-        let mut writer = WavWriter::new(&mut wav_data, *spec)?;
-        for &sample in samples {
-            writer.write_sample(sample)?;
-        }
-        writer.finalize()?;
-    }
+    let config = flacenc::config::Encoder::default().into_verified().unwrap();
+    let source = flacenc::source::MemSource::from_samples(
+        &samples_as_i32,
+        channels as usize,
+        bits_per_sample as usize,
+        sample_rate as usize,
+    );
+    let flac_stream = flacenc::encode_with_fixed_block_size(&config, source, config.block_size)
+        .expect("Encode failed.");
 
-    // Use ffmpeg to convert WAV to FLAC in memory
-    let mut child = Command::new("ffmpeg")
-        .args(&["-f", "wav", "-i", "pipe:0", "-f", "flac", "pipe:1"])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()?;
+    let mut sink = flacenc::bitsink::ByteSink::new();
+    flac_stream.write(&mut sink);
 
-    {
-        // Write WAV data to ffmpeg's stdin
-        let stdin = child.stdin.as_mut().ok_or("Failed to open stdin")?;
-        stdin.write_all(&wav_data.get_ref())?;
-    }
-    // Important: Close the child's stdin to signal that we are done writing
-    drop(child.stdin.take());
-
-    // Read FLAC data from ffmpeg's stdout
-    let mut flac_data = Vec::new();
-    {
-        let stdout = child.stdout.as_mut().ok_or("Failed to open stdout")?;
-        stdout.read_to_end(&mut flac_data)?;
-    }
-
-    // Capture stderr
-    let mut stderr = String::new();
-    if let Some(ref mut err) = child.stderr {
-        err.read_to_string(&mut stderr).ok();
-    }
-
-    let status = child.wait()?;
-    if !status.success() {
-        return Err(format!("ffmpeg failed to convert WAV to FLAC. Error: {}", stderr).into());
-    }
-
-    info!("Finished compressing data into FLAC format");
-    Ok(flac_data)
+    debug!("Finished compressing data into FLAC format");
+    Ok(sink.as_slice().to_vec())
 }
 
+// Decompress FLAC data to WAV format using claxon crate
 pub fn decompress_flac(buffer: &[u8]) -> Result<(Vec<i16>, WavSpec), Box<dyn Error + Send + Sync>> {
-    info!("Decompressing data from FLAC format...");
+    debug!("Decompressing data from FLAC format...");
 
-    // Initialize the FFmpeg library
-    ffmpeg::init().expect("Could not initialize ffmpeg");
+    let cursor = std::io::Cursor::new(buffer);
+    let mut reader = FlacReader::new(cursor)?;
 
-    // Use ffmpeg to convert FLAC to WAV in memory
-    let mut child = Command::new("ffmpeg")
-        .args(&["-f", "flac", "-i", "pipe:0", "-f", "wav", "pipe:1"])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()?;
+    let spec = WavSpec {
+        channels: reader.streaminfo().channels as u16,
+        sample_rate: reader.streaminfo().sample_rate,
+        bits_per_sample: reader.streaminfo().bits_per_sample as u16,
+        sample_format: hound::SampleFormat::Int,
+    };
 
-    {
-        // Write FLAC data to ffmpeg's stdin
-        let stdin = child.stdin.as_mut().ok_or("Failed to open stdin")?;
-        stdin.write_all(buffer)?;
-    }
-    // Important: Close the child's stdin to signal that we are done writing
-    drop(child.stdin.take());
-
-    // Read WAV data from ffmpeg's stdout
-    let mut wav_data = Vec::new();
-    {
-        let stdout = child.stdout.as_mut().ok_or("Failed to open stdout")?;
-        stdout.read_to_end(&mut wav_data)?;
+    let mut samples = Vec::new();
+    for sample in reader.samples() {
+        let sample: i32 = sample?;
+        samples.push(sample as i16);
     }
 
-    // Capture stderr
-    let mut stderr = String::new();
-    if let Some(ref mut err) = child.stderr {
-        err.read_to_string(&mut stderr).ok();
-    }
-
-    let status = child.wait()?;
-    if !status.success() {
-        return Err(format!("ffmpeg failed to convert FLAC to WAV. Error: {}", stderr).into());
-    }
-
-    // Parse WAV data
-    let mut cursor = Cursor::new(&wav_data);
-    let mut reader = WavReader::new(&mut cursor)?;
-    let spec = reader.spec();
-    let samples: Vec<i16> = reader.samples().map(|s| s.unwrap()).collect();
-
-    info!("Finished decompressing data from FLAC format");
+    debug!("Finished decompressing data from FLAC format");
     Ok((samples, spec))
 }
