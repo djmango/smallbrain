@@ -1,19 +1,23 @@
-use brotli::CompressorWriter;
-use brotli::Decompressor;
-use ffmpeg_next as ffmpeg;
-use hound::{WavReader, WavSpec, WavWriter};
+use crate::brotli_sb::{compress_brotli, decompress_brotli};
+use crate::wav::{read_wav_file, write_wav_file};
+use hound::WavSpec;
 use indicatif::{ProgressBar, ProgressStyle};
 use rayon::prelude::*;
 use std::env;
 use std::error::Error;
 use std::fs;
 use std::fs::File;
-use std::io::{BufReader, BufWriter, Cursor, Read, Write};
+use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::Path;
-use std::process::{Command, Stdio};
+use std::process::Command;
 use std::sync::{Arc, Mutex};
-use tracing::{info, Level};
+use tracing::{debug, info, Level};
 use tracing_subscriber::FmtSubscriber;
+
+mod brotli_sb;
+mod flac;
+mod wav;
+mod zlib;
 
 fn initialize_tracing(enable_logs: bool) {
     let subscriber = FmtSubscriber::builder()
@@ -26,224 +30,6 @@ fn initialize_tracing(enable_logs: bool) {
         .finish();
 
     tracing::subscriber::set_global_default(subscriber).expect("setting default subscriber failed");
-}
-
-fn read_wav_file(file_path: &str) -> Result<(Vec<i16>, WavSpec), Box<dyn Error + Send + Sync>> {
-    info!("Reading WAV file from {}", file_path);
-    let mut reader = WavReader::open(file_path)?;
-    let samples: Vec<i16> = reader.samples().map(|s| s.unwrap()).collect();
-    let spec = reader.spec();
-
-    info!("Read {} samples", samples.len());
-    Ok((samples, spec))
-}
-
-fn write_wav_file(
-    output_path: &str,
-    samples: &[i16],
-    spec: WavSpec,
-) -> Result<(), Box<dyn Error + Send + Sync>> {
-    info!("Writing WAV file to {}", output_path);
-    let mut writer = WavWriter::create(output_path, spec)?;
-    for &sample in samples {
-        writer.write_sample(sample)?;
-    }
-    writer.finalize()?;
-    info!("Finished writing WAV file to {}", output_path);
-    Ok(())
-}
-
-fn compress_flac(samples: &[i16], spec: &WavSpec) -> Result<Vec<u8>, Box<dyn Error + Send + Sync>> {
-    info!("Compressing data into FLAC format...");
-
-    // Initialize the FFmpeg library
-    ffmpeg::init().expect("Could not initialize ffmpeg");
-
-    // Prepare WAV data in memory using Cursor
-    let mut wav_data = Cursor::new(Vec::new());
-    {
-        let mut writer = WavWriter::new(&mut wav_data, *spec)?;
-        for &sample in samples {
-            writer.write_sample(sample)?;
-        }
-        writer.finalize()?;
-    }
-
-    // Use ffmpeg to convert WAV to FLAC in memory
-    let mut child = Command::new("ffmpeg")
-        .args(&["-f", "wav", "-i", "pipe:0", "-f", "flac", "pipe:1"])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()?;
-
-    {
-        // Write WAV data to ffmpeg's stdin
-        let stdin = child.stdin.as_mut().ok_or("Failed to open stdin")?;
-        stdin.write_all(&wav_data.get_ref())?;
-    }
-    // Important: Close the child's stdin to signal that we are done writing
-    drop(child.stdin.take());
-
-    // Read FLAC data from ffmpeg's stdout
-    let mut flac_data = Vec::new();
-    {
-        let stdout = child.stdout.as_mut().ok_or("Failed to open stdout")?;
-        stdout.read_to_end(&mut flac_data)?;
-    }
-
-    // Capture stderr
-    let mut stderr = String::new();
-    if let Some(ref mut err) = child.stderr {
-        err.read_to_string(&mut stderr).ok();
-    }
-
-    let status = child.wait()?;
-    if !status.success() {
-        return Err(format!("ffmpeg failed to convert WAV to FLAC. Error: {}", stderr).into());
-    }
-
-    info!("Finished compressing data into FLAC format");
-    Ok(flac_data)
-}
-
-fn decompress_flac(buffer: &[u8]) -> Result<(Vec<i16>, WavSpec), Box<dyn Error + Send + Sync>> {
-    info!("Decompressing data from FLAC format...");
-
-    // Initialize the FFmpeg library
-    ffmpeg::init().expect("Could not initialize ffmpeg");
-
-    // Use ffmpeg to convert FLAC to WAV in memory
-    let mut child = Command::new("ffmpeg")
-        .args(&["-f", "flac", "-i", "pipe:0", "-f", "wav", "pipe:1"])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()?;
-
-    {
-        // Write FLAC data to ffmpeg's stdin
-        let stdin = child.stdin.as_mut().ok_or("Failed to open stdin")?;
-        stdin.write_all(buffer)?;
-    }
-    // Important: Close the child's stdin to signal that we are done writing
-    drop(child.stdin.take());
-
-    // Read WAV data from ffmpeg's stdout
-    let mut wav_data = Vec::new();
-    {
-        let stdout = child.stdout.as_mut().ok_or("Failed to open stdout")?;
-        stdout.read_to_end(&mut wav_data)?;
-    }
-
-    // Capture stderr
-    let mut stderr = String::new();
-    if let Some(ref mut err) = child.stderr {
-        err.read_to_string(&mut stderr).ok();
-    }
-
-    let status = child.wait()?;
-    if !status.success() {
-        return Err(format!("ffmpeg failed to convert FLAC to WAV. Error: {}", stderr).into());
-    }
-
-    // Parse WAV data
-    let mut cursor = Cursor::new(&wav_data);
-    let mut reader = WavReader::new(&mut cursor)?;
-    let spec = reader.spec();
-    let samples: Vec<i16> = reader.samples().map(|s| s.unwrap()).collect();
-
-    info!("Finished decompressing data from FLAC format");
-    Ok((samples, spec))
-}
-
-fn compress_zlib(samples: &[i16], spec: &WavSpec) -> Result<Vec<u8>, Box<dyn Error + Send + Sync>> {
-    info!("Compressing data into zlib format...");
-
-    // Prepare WAV data in memory using Cursor
-    let mut wav_data = Cursor::new(Vec::new());
-    {
-        let mut writer = WavWriter::new(&mut wav_data, *spec)?;
-        for &sample in samples {
-            writer.write_sample(sample)?;
-        }
-        writer.finalize()?;
-    }
-
-    // Compress WAV data using zlib
-    let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
-    encoder.write_all(&wav_data.get_ref())?;
-    let compressed_data = encoder.finish()?;
-
-    info!("Finished compressing data into zlib format");
-    Ok(compressed_data)
-}
-
-fn decompress_zlib(buffer: &[u8]) -> Result<(Vec<i16>, WavSpec), Box<dyn Error + Send + Sync>> {
-    info!("Decompressing data from zlib format...");
-
-    // Decompress zlib data to WAV in memory
-    let mut decompressed_data = Vec::new();
-    {
-        let mut decoder = ZlibDecoder::new(buffer);
-        decoder.read_to_end(&mut decompressed_data)?;
-    }
-
-    // Parse WAV data
-    let mut cursor = Cursor::new(&decompressed_data);
-    let mut reader = WavReader::new(&mut cursor)?;
-    let spec = reader.spec();
-    let samples: Vec<i16> = reader.samples().map(|s| s.unwrap()).collect();
-
-    info!("Finished decompressing data from zlib format");
-    Ok((samples, spec))
-}
-
-fn compress_brotli(
-    samples: &[i16],
-    spec: &WavSpec,
-) -> Result<Vec<u8>, Box<dyn Error + Send + Sync>> {
-    info!("Compressing data into Brotli format...");
-
-    // Prepare WAV data in memory using Cursor
-    let mut wav_data = Cursor::new(Vec::new());
-    {
-        let mut writer = WavWriter::new(&mut wav_data, *spec)?;
-        for &sample in samples {
-            writer.write_sample(sample)?;
-        }
-        writer.finalize()?;
-    }
-
-    // Compress WAV data using Brotli
-    let mut compressed_data = Vec::new();
-    {
-        let mut compressor = CompressorWriter::new(&mut compressed_data, 4096, 11, 22);
-        compressor.write_all(&wav_data.get_ref())?;
-    }
-
-    info!("Finished compressing data into Brotli format");
-    Ok(compressed_data)
-}
-
-fn decompress_brotli(buffer: &[u8]) -> Result<(Vec<i16>, WavSpec), Box<dyn Error + Send + Sync>> {
-    info!("Decompressing data from Brotli format...");
-
-    // Decompress Brotli data to WAV in memory
-    let mut decompressed_data = Vec::new();
-    {
-        let mut decompressor = Decompressor::new(buffer, 4096);
-        decompressor.read_to_end(&mut decompressed_data)?;
-    }
-
-    // Parse WAV data
-    let mut cursor = Cursor::new(&decompressed_data);
-    let mut reader = WavReader::new(&mut cursor)?;
-    let spec = reader.spec();
-    let samples: Vec<i16> = reader.samples().map(|s| s.unwrap()).collect();
-
-    info!("Finished decompressing data from Brotli format");
-    Ok((samples, spec))
 }
 
 fn compress(samples: &[i16], spec: &WavSpec) -> Result<Vec<u8>, Box<dyn Error + Send + Sync>> {
@@ -286,7 +72,7 @@ fn process_batch(input_dir: &str) -> Result<(), Box<dyn Error + Send + Sync>> {
             let failed_files = Arc::clone(&failed_files);
 
             let result = (|| {
-                info!("Processing {}", file_path);
+                debug!("Processing {}", file_path);
 
                 let (samples, spec) = read_wav_file(file_path)?;
                 let compressed_data = compress(&samples, &spec)?;
@@ -303,7 +89,7 @@ fn process_batch(input_dir: &str) -> Result<(), Box<dyn Error + Send + Sync>> {
 
                 let is_equal = fs::read(file_path)? == fs::read(&decompressed_file_path)?;
                 if is_equal {
-                    info!(
+                    debug!(
                         "{} losslessly compressed from {} bytes to {} bytes",
                         file_path, file_size, compressed_size
                     );
