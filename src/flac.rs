@@ -1,11 +1,9 @@
 use claxon::FlacReader;
 use flacenc::component::BitRepr;
 use flacenc::error::Verify;
-use hound::{WavReader, WavSpec, WavWriter};
+use hound::WavSpec;
 use std::error::Error;
-use std::fs;
-use std::path::Path;
-use tracing::{debug, error};
+use tracing::debug;
 
 // Compress WAV data to FLAC format using flacenc crate
 pub fn compress_flac(
@@ -29,7 +27,7 @@ pub fn compress_flac(
         .expect("Encode failed.");
 
     let mut sink = flacenc::bitsink::ByteSink::new();
-    flac_stream.write(&mut sink);
+    let _ = flac_stream.write(&mut sink);
 
     debug!("Finished compressing data into FLAC format");
     Ok(sink.as_slice().to_vec())

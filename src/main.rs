@@ -1,6 +1,7 @@
-use crate::brotli_sb::{compress_brotli, decompress_brotli};
-use crate::flac::{compress_flac, decompress_flac};
+// use crate::brotli_sb::{compress_brotli, decompress_brotli};
+// use crate::flac::{compress_flac, decompress_flac};
 use crate::wav::{read_wav_file, write_wav_file};
+use crate::zstd::{compress_zstd, decompress_zstd};
 use hound::WavSpec;
 use indicatif::{ProgressBar, ProgressStyle};
 use rayon::prelude::*;
@@ -21,6 +22,7 @@ mod flac;
 mod tenbit;
 mod wav;
 mod zlib;
+mod zstd;
 
 fn initialize_tracing(enable_logs: bool) {
     let subscriber = FmtSubscriber::builder()
@@ -36,13 +38,15 @@ fn initialize_tracing(enable_logs: bool) {
 }
 
 fn compress(samples: &[i16], spec: &WavSpec) -> Result<Vec<u8>, Box<dyn Error + Send + Sync>> {
-    // compress_brotli(samples, spec)
-    compress_flac(samples, spec)
+    // let flac_data = compress_flac(samples, spec)?;
+    // compress_brotli(&flac_data)
+    compress_zstd(samples, spec)
 }
 
 fn decompress(buffer: &[u8]) -> Result<(Vec<i16>, WavSpec), Box<dyn Error + Send + Sync>> {
-    // decompress_brotli(buffer)
-    decompress_flac(buffer)
+    // let flac_data = decompress_brotli(buffer)?;
+    // decompress_flac(&flac_data)
+    decompress_zstd(buffer)
 }
 
 fn print_diff(original: &[u8], decompressed: &[u8]) {
@@ -139,7 +143,6 @@ fn process_batch(input_dir: &str) -> Result<(), Box<dyn Error + Send + Sync>> {
                 let file_size = fs::metadata(file_path)?.len();
                 let compressed_size = compressed_data.len() as u64;
 
-                return Ok((file_size, compressed_size));
                 if original_contents == decompressed_contents {
                     debug!(
                         "{} losslessly compressed from {} bytes to {} bytes",
